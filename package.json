@@ -1,0 +1,51 @@
+{
+  "name": "dsh-task-cost-gate",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Estimate the token cost of a task before it starts and let the user decide whether to run it.",
+  "license": "MIT",
+  "author": "Benson0103",
+  "homepage": "https://github.com/Benson0103/dsh-task-cost-gate#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Benson0103/dsh-task-cost-gate.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Benson0103/dsh-task-cost-gate/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "bundle",
+    "cost",
+    "token",
+    "budget"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Task cost gate",
+    "description": "Estimates the tokens and money a task will cost and asks you before the model starts.",
+    "detail": "docs/DETAIL.md"
+  }
+}

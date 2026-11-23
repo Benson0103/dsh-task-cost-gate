@@ -1,0 +1,7 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cost gauge">
+  <path d="M7.4 27.2a11 11 0 0 1 21.2 0" stroke="#4C7DF0" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M8.6 20.9l-1.9-1.1" stroke="#94B4F5" stroke-width="2" stroke-linecap="round"/>
+  <path d="M27.4 20.9l1.9-1.1" stroke="#94B4F5" stroke-width="2" stroke-linecap="round"/>
+  <path d="M18 27.2l6.1-7.7" stroke="#2F6BE0" stroke-width="2.3" stroke-linecap="round"/>
+  <circle cx="18" cy="27.2" r="2.4" fill="#2F6BE0"/>
+</svg>

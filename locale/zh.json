@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "任务成本预估",
+    "description": "在任务开始前估算要花多少 tokens、多少钱，由你决定是否继续。",
+    "detail": "docs/DETAIL.md"
+  }
+}

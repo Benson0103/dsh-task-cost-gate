@@ -1,0 +1,22 @@
+# This bundle inserts one host plugin. It reads the live session, estimates the
+# tokens and money an incoming task will cost, and asks the user to approve,
+# cancel, or stop being asked for the rest of that session before the first
+# model call of the task happens.
+#
+# Prices are quoted per one million tokens, in `currency` units. Keys are
+# "<provider>/<model>", then "<model>", with `defaultPrice` as the last resort.
+# The values below are examples: check your provider's current price list and
+# edit them here (or in Settings > Plugins > Task cost gate).
+- insert:
+    - id: task-cost-gate
+      name: dsh-task-cost-gate
+      config:
+        prices:
+          deepseek-official/deepseek-flash:
+            input: 2
+            cacheHit: 0.5
+            output: 8
+          deepseek-official/deepseek-v4-pro:
+            input: 4
+            cacheHit: 1
+            output: 16
