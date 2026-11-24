@@ -1,6 +1,7 @@
 /**
- * Task cost gate — a host plugin that estimates what an incoming task will cost
- * in tokens and money, and asks the user before the first model call happens.
+ * Task cost & time gate — a host plugin that estimates what an incoming task
+ * will cost in tokens, money and wall-clock time, and asks the user before the
+ * first model call happens.
  *
  * Why `agent/pre-step`: that waterfall is the only sanctioned point between
  * "the user submitted a message" and "the model is billed". Returning
@@ -16,6 +17,13 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import {
+  collectTiming,
+  DURATION_DEFAULTS,
+  estimateDuration,
+  formatDuration,
+  summarizeTiming,
+} from './duration.js'
 
 /** Token prices are quoted per this many tokens. */
 const PER_MILLION = 1_000_000
@@ -48,6 +56,11 @@ export const Config = z.object({
   minInputTokens: z.natural().default(0).description('Skip the gate for tasks whose first request is smaller than this.'),
   showMessagePreview: z.boolean().default(true).description('Quote the submitted message inside the card.'),
   askTimeoutMs: z.natural().default(0).description('Proceed automatically when the card is unanswered for this long (0 = wait for the user).'),
+  estimateDuration: z.boolean().default(true).description('Estimate the wall-clock time of the task next to its token cost.'),
+  calibrateFromSession: z.boolean().default(true).description('Learn model speed and tool time from earlier calls in the same session.'),
+  outputTokensPerSecond: z.natural().default(DURATION_DEFAULTS.outputTokensPerSecond).description('Output speed assumed when the session has no usable history (tokens/second).'),
+  firstTokenMs: z.natural().default(DURATION_DEFAULTS.firstTokenMs).description('Wait assumed before the first output token of each model call (ms).'),
+  toolMsPerStep: z.natural().default(DURATION_DEFAULTS.toolMsPerStep).description('Time assumed to run tools between two model calls (ms).'),
   defaultPrice: priceEntry.description('Fallback price for routes missing from `prices`.'),
   prices: z.dict(priceEntry).description('Price table keyed by `<provider>/<model>`, then `<model>`.'),
 })
@@ -78,6 +91,11 @@ export function resolveConfig(raw) {
     minInputTokens: natural(config.minInputTokens, 0),
     showMessagePreview: config.showMessagePreview !== false,
     askTimeoutMs: natural(config.askTimeoutMs, 0),
+    estimateDuration: config.estimateDuration !== false,
+    calibrateFromSession: config.calibrateFromSession !== false,
+    outputTokensPerSecond: Math.max(1, natural(config.outputTokensPerSecond, DURATION_DEFAULTS.outputTokensPerSecond)),
+    firstTokenMs: natural(config.firstTokenMs, DURATION_DEFAULTS.firstTokenMs),
+    toolMsPerStep: natural(config.toolMsPerStep, DURATION_DEFAULTS.toolMsPerStep),
     defaultPrice: normalizePrice(config.defaultPrice),
     prices,
   }
@@ -187,18 +205,80 @@ export function buildEstimate({ base, added, tools, steps, config, price, provid
   }
 }
 
+/**
+ * Project how long the task will take, using real timings from this session
+ * when it has enough history and the configured defaults otherwise.
+ */
+function buildDuration(session, selection, estimate, config) {
+  let timing
+  if (config.calibrateFromSession) {
+    try {
+      if (typeof session.snapshotEvents === 'function') {
+        timing = summarizeTiming(collectTiming(session.snapshotEvents(), selection))
+      }
+    } catch {
+      // A session log that cannot be read only costs us the calibration.
+      timing = undefined
+    }
+  }
+  return estimateDuration({
+    steps: estimate.steps,
+    outputTokensPerStep: config.outputTokensPerStep,
+    config,
+    timing,
+  })
+}
+
 /** Render the card title (one line, kept inside the composer width). */
 function title(locale, estimate, config) {
   const tokens = formatTokens(estimate.totalInput + estimate.totalOutput)
-  if (estimate.middle === undefined) {
-    return locale === 'en'
-      ? `This task should use about ${tokens} tokens. Continue?`
-      : `本次任务预计消耗约 ${tokens} tokens，继续吗？`
+  const duration = estimate.duration
+  const time = duration === undefined ? undefined : formatDuration(duration.totalMs, locale)
+  const money = estimate.middle === undefined ? undefined : formatMoney(estimate.middle, config.currency)
+  if (locale === 'en') {
+    if (time !== undefined && money !== undefined) return `This task should take about ${time} and use about ${tokens} tokens (${money}). Continue?`
+    if (time !== undefined) return `This task should take about ${time} and use about ${tokens} tokens. Continue?`
+    if (money !== undefined) return `This task should use about ${tokens} tokens (${money}). Continue?`
+    return `This task should use about ${tokens} tokens. Continue?`
   }
-  const money = formatMoney(estimate.middle, config.currency)
-  return locale === 'en'
-    ? `This task should use about ${tokens} tokens (${money}). Continue?`
-    : `本次任务预计消耗约 ${tokens} tokens（${money}），继续吗？`
+  if (time !== undefined && money !== undefined) return `本次任务预计约 ${time}、${tokens} tokens（${money}），继续吗？`
+  if (time !== undefined) return `本次任务预计约 ${time}、${tokens} tokens，继续吗？`
+  if (money !== undefined) return `本次任务预计消耗约 ${tokens} tokens（${money}），继续吗？`
+  return `本次任务预计消耗约 ${tokens} tokens，继续吗？`
+}
+
+/** Render the duration section of the card body. */
+function durationLines(locale, time) {
+  if (locale === 'en') {
+    const lines = [
+      '',
+      `**Estimated time: about ${formatDuration(time.totalMs, locale)}**`,
+      '',
+      `- Model calls: ${time.calls} × about ${formatDuration(time.perCallMs, locale)} ≈ ${formatDuration(time.modelMs, locale)} (includes the wait for the first token)`,
+    ]
+    if (time.toolMs > 0) {
+      const measured = time.sources.tools === 'session' ? ' (measured in this session)' : ''
+      lines.push(`- Tool phases: ${time.calls - 1} × about ${formatDuration(time.toolMsPerStep, locale)} ≈ ${formatDuration(time.toolMs, locale)}${measured}`)
+    }
+    lines.push(time.sources.speed === 'session'
+      ? `- Basis: the last ${time.samples.calls} real model calls in this session (about ${Math.round(time.tokensPerSecond)} tokens/s, first token after about ${formatDuration(time.firstTokenMs, locale)})`
+      : '- Basis: configured default speed (this session does not have enough history yet)')
+    return lines
+  }
+  const lines = [
+    '',
+    `**预计耗时：约 ${formatDuration(time.totalMs, locale)}**`,
+    '',
+    `- 模型生成：${time.calls} 次调用 × 约 ${formatDuration(time.perCallMs, locale)} ≈ ${formatDuration(time.modelMs, locale)}（含首字等待）`,
+  ]
+  if (time.toolMs > 0) {
+    const measured = time.sources.tools === 'session' ? '（本会话实测）' : ''
+    lines.push(`- 工具执行：${time.calls - 1} 段 × 约 ${formatDuration(time.toolMsPerStep, locale)} ≈ ${formatDuration(time.toolMs, locale)}${measured}`)
+  }
+  lines.push(time.sources.speed === 'session'
+    ? `- 依据：本会话最近 ${time.samples.calls} 次真实调用（约 ${Math.round(time.tokensPerSecond)} tokens/秒，首字约 ${formatDuration(time.firstTokenMs, locale)}）`
+    : '- 依据：默认速度估算（本会话历史不足，可在插件设置里调整）')
+  return lines
 }
 
 /** Render the card body as markdown. */
@@ -219,10 +299,11 @@ function detail(locale, estimate, config, messages, currency) {
       `- First request: ${formatTokens(estimate.firstInput)} tokens`,
       `- Assuming ${estimate.steps} model calls: ${formatTokens(estimate.totalInput)} input and about ${formatTokens(estimate.totalOutput)} output tokens`,
     )
+    if (estimate.duration !== undefined) lines.push(...durationLines(locale, estimate.duration))
     if (price === undefined) {
       lines.push(
         '',
-        `No price is configured for \`${route}\`, so only tokens are shown. Add it under **Settings → Plugins → Task cost gate** to see money as well.`,
+        `No price is configured for \`${route}\`, so only tokens${estimate.duration === undefined ? '' : ' and time'} are shown. Add it under **Settings → Plugins → Task cost & time gate** to see money as well.`,
       )
     } else {
       lines.push(
@@ -249,10 +330,11 @@ function detail(locale, estimate, config, messages, currency) {
     `- 首次请求：${formatTokens(estimate.firstInput)} tokens`,
     `- 按 ${estimate.steps} 次模型调用估算：输入 ${formatTokens(estimate.totalInput)} tokens，输出约 ${formatTokens(estimate.totalOutput)} tokens`,
   )
+  if (estimate.duration !== undefined) lines.push(...durationLines(locale, estimate.duration))
   if (price === undefined) {
     lines.push(
       '',
-      `这个模型（\`${route}\`）还没有配置单价，所以只给出 token 估算。在 **设置 → 插件 → 任务成本预估** 里补上价格就能显示费用。`,
+      `这个模型（\`${route}\`）还没有配置单价，所以只给出 token${estimate.duration === undefined ? '' : ' 与耗时'}估算。在 **设置 → 插件 → 任务成本与耗时预估** 里补上价格就能显示费用。`,
     )
   } else {
     lines.push(
@@ -273,13 +355,13 @@ function buildQuestion(estimate, config, messages) {
   const locale = config.language
   const labels = locale === 'en'
     ? {
-        ask: 'Task cost',
+        ask: 'Task cost & time',
         continue: 'Run it (Recommended)',
         cancel: 'Cancel this task',
         mute: "Don't ask again this session",
       }
     : {
-        ask: '任务成本预估',
+        ask: '任务成本与耗时',
         continue: '继续执行（推荐）',
         cancel: '取消本次任务',
         mute: '本会话不再询问',
@@ -410,6 +492,7 @@ export function apply(ctx, rawConfig) {
         model: selection.model,
       })
       if (estimate.firstInput < config.minInputTokens) return await next()
+      if (config.estimateDuration) estimate.duration = buildDuration(session, selection, estimate, config)
       const label = modelLabel(ctx, selection)
       if (label !== undefined) estimate.model = label
       const { labels, question } = buildQuestion(estimate, config, claimed)
