@@ -1,9 +1,9 @@
 {
   "name": "dsh-task-cost-gate",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "Estimate the token cost and wall-clock time of a task before it starts and let the user decide whether to run it.",
+  "description": "Estimate the token cost, money, wall-clock time and prompt-cache-hit range of a task before it starts and let the user decide whether to run it.",
   "license": "MIT",
   "author": "Benson0103",
   "homepage": "https://github.com/Benson0103/dsh-task-cost-gate#readme",
@@ -24,7 +24,9 @@
     "budget",
     "duration",
     "time",
-    "eta"
+    "eta",
+    "cache",
+    "prompt-cache"
   ],
   "exports": {
     ".": "./index.js",
@@ -34,6 +36,7 @@
   "files": [
     "index.js",
     "duration.js",
+    "cache.js",
     "cordis.patch.yml",
     "locale/*.json",
     "docs",

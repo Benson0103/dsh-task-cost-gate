@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "Task cost & time gate",
-    "description": "Estimates the tokens, money and time a task will cost and asks you before the model starts.",
+    "title": "Task cost, time & cache gate",
+    "description": "Estimates the tokens, money, time and prompt-cache hits a task will cost, using other conversations to narrow the range, and asks you before the model starts.",
     "detail": "docs/DETAIL.md"
   }
 }

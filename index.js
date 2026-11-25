@@ -1,7 +1,8 @@
 /**
- * Task cost & time gate — a host plugin that estimates what an incoming task
- * will cost in tokens, money and wall-clock time, and asks the user before the
- * first model call happens.
+ * Task cost, time & cache gate — a host plugin that estimates what an incoming
+ * task will cost in tokens, money and wall-clock time, narrows the cost range
+ * with measured prompt-cache hits from other conversations, and asks the user
+ * before the first model call happens.
  *
  * Why `agent/pre-step`: that waterfall is the only sanctioned point between
  * "the user submitted a message" and "the model is billed". Returning
@@ -17,6 +18,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import { collectCacheCalls, projectCost, summarizeCache } from './cache.js'
 import {
   collectTiming,
   DURATION_DEFAULTS,
@@ -25,8 +27,8 @@ import {
   summarizeTiming,
 } from './duration.js'
 
-/** Token prices are quoted per this many tokens. */
-const PER_MILLION = 1_000_000
+/** Upper bound on assumed model calls; keeps a bad config from producing an absurd projection. */
+const MAX_STEPS = 64
 
 /** Question id of the gate card; stable so a re-render neither duplicates nor drops it. */
 const ASK_ID = 'task-cost-gate'
@@ -51,7 +53,11 @@ export const Config = z.object({
   assumedSteps: z.natural().default(4).description('Model calls a task is assumed to need (>= 1).'),
   outputTokensPerStep: z.natural().default(1200).description('Completion tokens assumed per model call.'),
   growthTokensPerStep: z.natural().default(1800).description('Prompt growth tokens added per call (earlier output plus tool results).'),
-  cacheHitRatio: z.number().min(0).max(1).default(0.6).description('Assumed share of prompt tokens billed at the cache-hit price.'),
+  cacheHitRatio: z.number().min(0).max(1).default(0.6).description('Fallback share of prompt tokens billed at the cache-hit price when no other conversation can be sampled.'),
+  calibrateCacheFromSessions: z.boolean().default(true).description('Measure the prompt-cache hit rate on other conversations of the same route.'),
+  cacheSampleSessions: z.natural().default(6).description('How many other conversations to sample per estimate.'),
+  cacheSampleCalls: z.natural().default(240).description('Upper bound on sampled model calls per estimate.'),
+  cacheSampleTtlMs: z.natural().default(300000).description('How long a measured cache profile is reused before sampling again (ms).'),
   firstRequestToolsTokens: z.natural().default(6000).description('Tool-schema tokens added when the session has never issued a request yet.'),
   minInputTokens: z.natural().default(0).description('Skip the gate for tasks whose first request is smaller than this.'),
   showMessagePreview: z.boolean().default(true).description('Quote the submitted message inside the card.'),
@@ -87,6 +93,10 @@ export function resolveConfig(raw) {
     outputTokensPerStep: natural(config.outputTokensPerStep, 1200),
     growthTokensPerStep: natural(config.growthTokensPerStep, 1800),
     cacheHitRatio: ratio(config.cacheHitRatio, 0.6),
+    calibrateCacheFromSessions: config.calibrateCacheFromSessions !== false,
+    cacheSampleSessions: Math.max(1, natural(config.cacheSampleSessions, 6)),
+    cacheSampleCalls: Math.max(12, natural(config.cacheSampleCalls, 240)),
+    cacheSampleTtlMs: natural(config.cacheSampleTtlMs, 300_000),
     firstRequestToolsTokens: natural(config.firstRequestToolsTokens, 6000),
     minInputTokens: natural(config.minInputTokens, 0),
     showMessagePreview: config.showMessagePreview !== false,
@@ -142,6 +152,17 @@ function formatMoney(amount, currency) {
   return `${currency}${amount.toFixed(digits)}`
 }
 
+/** Format a ratio inside 0..1 as a whole percentage. */
+function percent(value) {
+  const parsed = Number(value)
+  return `${Math.round((Number.isFinite(parsed) ? parsed : 0) * 100)}%`
+}
+
+/** Join a measured low/high pair without repeating an identical value. */
+function range(low, high, separator) {
+  return low === high ? low : `${low}${separator}${high}`
+}
+
 /** Collapse a submitted message into a short single-line preview. */
 function preview(messages, limit = 180) {
   const text = messages
@@ -174,34 +195,118 @@ export function priceFor(config, provider, model) {
  * @param deps - measured facts about the session.
  * @param config - normalized plugin configuration.
  */
-export function buildEstimate({ base, added, tools, steps, config, price, provider, model }) {
+export function buildEstimate({ base, added, tools, steps, config, price, provider, model, cache }) {
   const firstInput = Math.max(0, base + added + tools)
+  const calls = Math.min(MAX_STEPS, Math.max(1, Math.round(Number(steps) || 1)))
   const growth = config.growthTokensPerStep
-  // Sum of `firstInput + i * growth` for i in [0, steps).
-  const totalInput = steps * firstInput + (growth * steps * (steps - 1)) / 2
-  const totalOutput = steps * config.outputTokensPerStep
-  const cost = (hitRatio) => {
-    if (price === undefined) return undefined
-    const cached = totalInput * hitRatio
-    const uncached = totalInput - cached
-    return (uncached * price.input + cached * price.cacheHit + totalOutput * price.output) / PER_MILLION
+  // Sum of `firstInput + i * growth` for i in [0, calls).
+  const totalInput = calls * firstInput + (growth * calls * (calls - 1)) / 2
+  const totalOutput = calls * config.outputTokensPerStep
+  const sharesOf = (kind) => {
+    const observed = cache?.shares?.[kind]
+    if (Array.isArray(observed) && observed.length === calls) return observed
+    // No usable cross-session profile: keep the old 0% / fallback / 100% bounds.
+    return Array.from({ length: calls }, () => (kind === 'low' ? 0 : kind === 'high' ? 1 : config.cacheHitRatio))
   }
-  const midpoint = cost(config.cacheHitRatio)
-  const bounds = price === undefined ? [] : [cost(0), cost(1)].filter((value) => value !== undefined)
+  const project = (kind) => projectCost({
+    firstInput,
+    growthTokensPerStep: growth,
+    steps: calls,
+    outputTokensPerStep: config.outputTokensPerStep,
+    price,
+    shares: sharesOf(kind),
+  })
+  const low = project('low')
+  const middle = project('middle')
+  const high = project('high')
+  const costs = [low.cost, middle.cost, high.cost].filter((value) => value !== undefined)
   return {
     provider,
     model,
     base,
     added,
     tools,
-    steps,
+    steps: calls,
     firstInput,
     totalInput,
     totalOutput,
     price,
-    middle: midpoint,
-    low: bounds.length === 0 ? undefined : Math.min(...bounds, midpoint),
-    high: bounds.length === 0 ? undefined : Math.max(...bounds, midpoint),
+    cachedTokens: {
+      low: low.cachedTokens,
+      middle: middle.cachedTokens,
+      high: high.cachedTokens,
+    },
+    uncachedTokens: {
+      low: low.uncachedTokens,
+      middle: middle.uncachedTokens,
+      high: high.uncachedTokens,
+    },
+    middle: middle.cost,
+    low: costs.length === 0 ? undefined : Math.min(...costs),
+    high: costs.length === 0 ? undefined : Math.max(...costs),
+    cache,
+  }
+}
+
+/**
+ * Cached cross-session cache profile. Sampling replays other session logs, so a
+ * profile is reused for a few minutes instead of being rebuilt for every task.
+ */
+const cacheMemo = { key: undefined, value: undefined, expiresAt: 0 }
+
+/**
+ * Sample the prompt-cache hit rate of other conversations on the same route.
+ *
+ * Cache hits cannot be seen in this session before the first request: the
+ * provider reports them only in `usage.cacheReadTokens` after a call. Other
+ * conversations of the same route already carry that fact, so they are used as
+ * the prior. A fresh conversation and a continuation start from different
+ * prefixes and are sampled from different buckets (see `summarizeCache`).
+ */
+async function buildCacheProfile(ctx, { session, selection, signal, steps, headerless, config }) {
+  if (!config.calibrateCacheFromSessions) return undefined
+  const query = ctx.get?.('sessionQuery')
+  if (query === undefined || typeof query.listSessions !== 'function' || typeof query.readSession !== 'function') return undefined
+  const key = `${selection.provider}/${selection.model}|${headerless ? 'fresh' : 'existing'}|${steps}`
+  const now = Date.now()
+  if (cacheMemo.key === key && cacheMemo.expiresAt > now) return cacheMemo.value
+  try {
+    const records = await query.listSessions(signal)
+    const currentId = session?.header?.id ?? session?.id
+    const candidates = (Array.isArray(records) ? records : []).filter((record) => {
+      const header = record?.header
+      if (header === null || header === undefined || typeof header !== 'object') return false
+      if (typeof header.id !== 'string' || header.id.length === 0) return false
+      return header.id !== currentId && header.origin !== 'subagent'
+    })
+    const maxSessions = Math.min(config.cacheSampleSessions, 12)
+    const perSession = Math.max(6, Math.floor(config.cacheSampleCalls / maxSessions))
+    const calls = []
+    for (const record of candidates.slice(0, maxSessions)) {
+      if (signal?.aborted === true) break
+      try {
+        const snapshot = await query.readSession(record.header.id)
+        const found = collectCacheCalls(snapshot?.events, selection, record.header.id)
+        if (found.length <= perSession) calls.push(...found)
+        // Keep the first calls of this conversation (the fresh-session prior)
+        // as well as its most recent calls (the steady-state prior).
+        else calls.push(...found.slice(0, 5), ...found.slice(-(perSession - 5)))
+      } catch {
+        // One unreadable or incompatible session must not stop the sample.
+      }
+    }
+    const profile = summarizeCache(calls, {
+      steps,
+      freshSession: headerless,
+      maxCalls: config.cacheSampleCalls,
+    })
+    if (profile === undefined) return undefined
+    cacheMemo.key = key
+    cacheMemo.value = profile
+    cacheMemo.expiresAt = now + config.cacheSampleTtlMs
+    return profile
+  } catch {
+    return undefined
   }
 }
 
@@ -285,7 +390,14 @@ function durationLines(locale, time) {
 function detail(locale, estimate, config, messages, currency) {
   const lines = []
   const price = estimate.price
+  const cache = estimate.cache
   const route = `${estimate.provider}/${estimate.model}`
+  const billed = estimate.uncachedTokens === undefined
+    ? undefined
+    : {
+        low: Math.min(estimate.uncachedTokens.low, estimate.uncachedTokens.high),
+        high: Math.max(estimate.uncachedTokens.low, estimate.uncachedTokens.high),
+      }
   if (locale === 'en') {
     if (config.showMessagePreview) {
       const text = preview(messages)
@@ -299,11 +411,19 @@ function detail(locale, estimate, config, messages, currency) {
       `- First request: ${formatTokens(estimate.firstInput)} tokens`,
       `- Assuming ${estimate.steps} model calls: ${formatTokens(estimate.totalInput)} input and about ${formatTokens(estimate.totalOutput)} output tokens`,
     )
+    if (cache !== undefined) {
+      lines.push(
+        `- Provider cache hits: about ${range(formatTokens(estimate.cachedTokens.low), formatTokens(estimate.cachedTokens.high), '–')} of those input tokens`,
+        `- Billed input (uncached): about ${range(formatTokens(billed.low), formatTokens(billed.high), '–')} tokens`,
+        `- Cache-hit rate: measured on ${cache.samples.calls} calls from ${cache.samples.sessions} other conversations — ${cache.freshSession ? 'first call of a new conversation' : 'first call of a continued turn'} ${range(percent(cache.first.low), percent(cache.first.high), '–')}, later calls ${range(percent(cache.later.low), percent(cache.later.high), '–')}`,
+        '- Cache hits change cost and the first-token wait, not the total token count.',
+      )
+    }
     if (estimate.duration !== undefined) lines.push(...durationLines(locale, estimate.duration))
     if (price === undefined) {
       lines.push(
         '',
-        `No price is configured for \`${route}\`, so only tokens${estimate.duration === undefined ? '' : ' and time'} are shown. Add it under **Settings → Plugins → Task cost & time gate** to see money as well.`,
+        `No price is configured for \`${route}\`, so only tokens${estimate.duration === undefined ? '' : ' and time'} are shown. Add it under **Settings → Plugins → Task cost, time & cache gate** to see money as well.`,
       )
     } else {
       lines.push(
@@ -311,7 +431,9 @@ function detail(locale, estimate, config, messages, currency) {
         `**Estimated cost: ${formatMoney(estimate.middle, currency)}** (range ${formatMoney(estimate.low, currency)} – ${formatMoney(estimate.high, currency)})`,
         '',
         `- Prices per 1M tokens: input ${currency}${price.input}, cache hit ${currency}${price.cacheHit}, output ${currency}${price.output}`,
-        `- Cache hits assumed for ${Math.round(config.cacheHitRatio * 100)}% of the prompt`,
+        cache === undefined
+          ? `- Cache hits assumed for ${percent(config.cacheHitRatio)} of the prompt (not enough other conversations to measure it)`
+          : '- The cost range reflects the observed cache-hit range above.',
         '',
         '> Cancelling leaves this message out of the conversation and costs nothing.',
       )
@@ -330,11 +452,19 @@ function detail(locale, estimate, config, messages, currency) {
     `- 首次请求：${formatTokens(estimate.firstInput)} tokens`,
     `- 按 ${estimate.steps} 次模型调用估算：输入 ${formatTokens(estimate.totalInput)} tokens，输出约 ${formatTokens(estimate.totalOutput)} tokens`,
   )
+  if (cache !== undefined) {
+    lines.push(
+      `- 其中缓存命中：约 ${range(formatTokens(estimate.cachedTokens.low), formatTokens(estimate.cachedTokens.high), '～')} tokens`,
+      `- 按未命中计费的输入：约 ${range(formatTokens(billed.low), formatTokens(billed.high), '～')} tokens`,
+      `- 缓存命中率：参考其他 ${cache.samples.sessions} 个对话的 ${cache.samples.calls} 次真实调用，${cache.freshSession ? '新会话首步' : '续聊首步'} ${range(percent(cache.first.low), percent(cache.first.high), '～')}，后续 ${range(percent(cache.later.low), percent(cache.later.high), '～')}`,
+      '- 缓存只影响费用与首字等待，不改变 token 总数。',
+    )
+  }
   if (estimate.duration !== undefined) lines.push(...durationLines(locale, estimate.duration))
   if (price === undefined) {
     lines.push(
       '',
-      `这个模型（\`${route}\`）还没有配置单价，所以只给出 token${estimate.duration === undefined ? '' : ' 与耗时'}估算。在 **设置 → 插件 → 任务成本与耗时预估** 里补上价格就能显示费用。`,
+      `这个模型（\`${route}\`）还没有配置单价，所以只给出 token${estimate.duration === undefined ? '' : ' 与耗时'}估算。在 **设置 → 插件 → 任务成本、耗时与缓存预估** 里补上价格就能显示费用。`,
     )
   } else {
     lines.push(
@@ -342,7 +472,9 @@ function detail(locale, estimate, config, messages, currency) {
       `**预计花费：${formatMoney(estimate.middle, currency)}**（区间 ${formatMoney(estimate.low, currency)} ～ ${formatMoney(estimate.high, currency)}）`,
       '',
       `- 单价（每百万 tokens）：输入 ${currency}${price.input}、缓存命中 ${currency}${price.cacheHit}、输出 ${currency}${price.output}`,
-      `- 缓存命中率按 ${Math.round(config.cacheHitRatio * 100)}% 估算`,
+      cache === undefined
+        ? `- 缓存命中率按 ${percent(config.cacheHitRatio)} 估算（其他对话样本不足，暂用默认值）`
+        : '- 费用区间按上面观测到的缓存命中率估算。',
       '',
       '> 取消后这条消息不会进入对话，也不产生费用。',
     )
@@ -355,13 +487,13 @@ function buildQuestion(estimate, config, messages) {
   const locale = config.language
   const labels = locale === 'en'
     ? {
-        ask: 'Task cost & time',
+        ask: 'Task cost, time & cache',
         continue: 'Run it (Recommended)',
         cancel: 'Cancel this task',
         mute: "Don't ask again this session",
       }
     : {
-        ask: '任务成本与耗时',
+        ask: '任务成本、耗时与缓存',
         continue: '继续执行（推荐）',
         cancel: '取消本次任务',
         mute: '本会话不再询问',
@@ -479,19 +611,29 @@ export function apply(ctx, rawConfig) {
       const base = measureBase(meter, session)
       const added = measureMessages(meter, claimed)
       const headerless = typeof session.requestHeader === 'function' && session.requestHeader() === undefined
-      const steps = config.assumedSteps
+      const steps = Math.min(MAX_STEPS, config.assumedSteps)
+      const tools = headerless ? config.firstRequestToolsTokens : 0
+      if (base + added + tools < config.minInputTokens) return await next()
+      const cache = await buildCacheProfile(ctx, {
+        session,
+        selection,
+        signal,
+        steps,
+        headerless,
+        config,
+      })
       const price = priceFor(config, selection.provider, selection.model)
       const estimate = buildEstimate({
         base,
         added,
-        tools: headerless ? config.firstRequestToolsTokens : 0,
+        tools,
         steps,
         config,
         price,
         provider: selection.provider,
         model: selection.model,
+        cache,
       })
-      if (estimate.firstInput < config.minInputTokens) return await next()
       if (config.estimateDuration) estimate.duration = buildDuration(session, selection, estimate, config)
       const label = modelLabel(ctx, selection)
       if (label !== undefined) estimate.model = label

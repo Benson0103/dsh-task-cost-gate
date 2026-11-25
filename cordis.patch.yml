@@ -1,16 +1,21 @@
 # This bundle inserts one host plugin. It reads the live session, estimates the
-# tokens, money and wall-clock time an incoming task will cost, and asks the
-# user to approve, cancel, or stop being asked for the rest of that session
-# before the first model call of the task happens.
+# tokens, money and wall-clock time an incoming task will cost, samples prompt-
+# cache hits from other conversations, and asks the user to approve, cancel, or
+# stop being asked for the rest of that session before the first model call.
 #
 # Prices are quoted per one million tokens, in `currency` units. Keys are
 # "<provider>/<model>", then "<model>", with `defaultPrice` as the last resort.
 # The values below are examples: check your provider's current price list and
-# edit them here (or in Settings > Plugins > Task cost & time gate).
+# edit them here (or in Settings > Plugins > Task cost, time & cache gate).
 #
 # Duration defaults (220 output tokens/s, 1.4 s first token, 5 s tools per
 # step) are used only until the session has three real calls to calibrate
 # against; override them in the same config block when your route differs.
+#
+# Prompt-cache hits are sampled from up to six other conversations on the same
+# provider/model (240 calls, five-minute TTL) and are split into first-call and
+# later-call profiles. With fewer than three conversations or twelve calls the
+# plugin falls back to `cacheHitRatio` (60%) and the full 0-100% range.
 - insert:
     - id: task-cost-gate
       name: dsh-task-cost-gate
